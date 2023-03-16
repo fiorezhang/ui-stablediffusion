@@ -1,0 +1,1 @@
+pyinstaller -F ui-stablediffusion.py --copy-metadata tqdm --copy-metadata regex --copy-metadata packaging --copy-metadata requests --copy-metadata filelock --copy-metadata numpy --copy-metadata tokenizers --add-data="C:\Users\test\anaconda3\envs\sd\Lib\site-packages\transformers;transformers"

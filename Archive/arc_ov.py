@@ -9,33 +9,27 @@ import inspect
 from typing import List, Optional, Union
 from transformers import CLIPTokenizer
 from diffusers.pipeline_utils import DiffusionPipeline
-from diffusers.schedulers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, EulerAncestralDiscreteScheduler
+from diffusers.schedulers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler
 from openvino.runtime import Model
 from openvino.runtime import Core
 from transformers import CLIPTokenizer
+from diffusers.schedulers import LMSDiscreteScheduler
 #import ipywidgets as widgets
 import random
-import time
-
-from typing import List, Optional, Union, Dict
-import PIL
-import cv2
 
 TEXT_ENCODER_ONNX_PATH = Path('ovTempModels/text_encoder.onnx')
 TEXT_ENCODER_OV_PATH = Path('ovModels/text_encoder.xml')
 UNET_ONNX_PATH = Path('ovTempModels/unet.onnx')
 UNET_OV_PATH = Path('ovModels/unet.xml')
-VAE_ENCODER_ONNX_PATH = Path('ovTempModels/vae_encoder.onnx')
-VAE_ENCODER_OV_PATH = Path('ovModels/vae_encoder.xml')
-VAE_DECODER_ONNX_PATH = Path('ovTempModels/vae_decoder.onnx')
-VAE_DECODER_OV_PATH = Path('ovModels/vae_decoder.xml')
+VAE_ONNX_PATH = Path('ovTempModels/vae_decoder.onnx')
+VAE_OV_PATH = Path('ovModels/vae_decoder.xml')
 
 # ### Text Encoder
 # 
 # The text-encoder is responsible for transforming the input prompt, e.g. "a photo of an astronaut riding a horse" into an embedding space that can be understood by the U-Net. It is usually a simple transformer-based encoder that maps a sequence of input tokens to a sequence of latent text embeddings.
 # 
 # Input of text encoder is tensor `input_ids` which contains indexes of tokens from text processed by tokenizer and padded to maximum length accepted by model. Model outputs are 2 tensors: `last_hidden_state` - hidden state from the last MultiHeadAttention layer in model and `pooler_out` - Pooled output for whole model hidden states. We will use `opset_version=14`, because model contains `triu` operation, supported in ONNX only starting from this opset.
-def convert_encoder_onnx(text_encoder: StableDiffusionPipeline, onnx_path:Path):
+def convert_encoder_onnx(pipe: StableDiffusionPipeline, onnx_path:Path):
     """
     Convert Text Encoder model to ONNX. 
     Function accepts pipeline, prepares example inputs for ONNX conversion via torch.export, 
@@ -46,7 +40,16 @@ def convert_encoder_onnx(text_encoder: StableDiffusionPipeline, onnx_path:Path):
         None
     """
     if not onnx_path.exists():
-        input_ids = torch.ones((1, 77), dtype=torch.long)
+        text = 'a photo of an astronaut riding a horse on mars'
+        text_encoder = pipe.text_encoder
+        input_ids = pipe.tokenizer(
+            text,
+            padding="max_length",
+            max_length=pipe.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids
+
         # switch model to inference mode
         text_encoder.eval()
 
@@ -59,7 +62,7 @@ def convert_encoder_onnx(text_encoder: StableDiffusionPipeline, onnx_path:Path):
                 text_encoder,  # model instance
                 input_ids,  # inputs for model tracing
                 onnx_path,  # output file for saving result
-                input_names=['tokens'],  # model input name for onnx representation
+                input_names=['input_ids'],  # model input name for onnx representation
                 output_names=['last_hidden_state', 'pooler_out'],  # model output names for onnx representation
                 opset_version=14  # onnx opset version for export
             )
@@ -67,9 +70,9 @@ def convert_encoder_onnx(text_encoder: StableDiffusionPipeline, onnx_path:Path):
     else:
         print('Text Encoder exists for ONNX')
     
-def convert_encoder_ov(text_encoder):
+def convert_encoder_ov(pipe):
     if not TEXT_ENCODER_OV_PATH.exists():
-        convert_encoder_onnx(text_encoder, TEXT_ENCODER_ONNX_PATH)
+        convert_encoder_onnx(pipe, TEXT_ENCODER_ONNX_PATH)
         os.system("mo --input_model " + TEXT_ENCODER_ONNX_PATH.parent.name + "/" + TEXT_ENCODER_ONNX_PATH.name + " --output_dir " + TEXT_ENCODER_OV_PATH.parent.name + " --compress_to_fp16")
         print('Text Encoder successfully converted to IR')
     else:
@@ -83,7 +86,7 @@ def convert_encoder_ov(text_encoder):
 # * `encoder_hidden_state` - hidden state of text encoder.
 # 
 # Model predicts the `sample` state for the next step.
-def convert_unet_onnx(unet:StableDiffusionPipeline, onnx_path:Path):
+def convert_unet_onnx(pipe:StableDiffusionPipeline, onnx_path:Path):
     """
     Convert Unet model to ONNX, then IR format. 
     Function accepts pipeline, prepares example inputs for ONNX conversion via torch.export, 
@@ -95,29 +98,48 @@ def convert_unet_onnx(unet:StableDiffusionPipeline, onnx_path:Path):
     """
     if not onnx_path.exists():
         # prepare inputs
-        encoder_hidden_state = torch.ones((2, 77, 768))
+        text = 'a photo of an astronaut riding a horse on mars'
+        text_encoder = pipe.text_encoder
+        input_ids = pipe.tokenizer(
+            text,
+            padding="max_length",
+            max_length=pipe.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids
+        with torch.no_grad():
+            text_encoder_output = text_encoder(input_ids)
         latents_shape = (2, 4, 512 // 8, 512 // 8)
         latents = torch.randn(latents_shape)
         t = torch.from_numpy(np.array(1, dtype=float))
 
         # model size > 2Gb, it will be represented as onnx with external data files, we will store it in separated directory for avoid a lot of files in current directory
         onnx_path.parent.mkdir(exist_ok=True, parents=True)
-        unet.eval()
+
+        max_length = input_ids.shape[-1]
+
+        # we plan to use unet with classificator free guidence, in this cace conditionaly generated text embeddings should be concatenated with uncoditional
+        uncond_input = pipe.tokenizer([""], padding="max_length", max_length=max_length, return_tensors="pt")
+        uncond_embeddings = pipe.text_encoder(uncond_input.input_ids)[0]
+        encoder_hidden_state = torch.cat([uncond_embeddings, text_encoder_output[0]])
+
+        # to make sure that model works
+        pipe.unet(latents, t, encoder_hidden_state)[0]
 
         with torch.no_grad():
             torch.onnx.export(
-                unet, 
+                pipe.unet, 
                 (latents, t, encoder_hidden_state), str(onnx_path),
-                input_names=['latent_model_input', 't', 'encoder_hidden_states'],
+                input_names=['sample', 'timestep', 'encoder_hidden_state'],
                 output_names=['out_sample']
             )
         print('Unet successfully converted to ONNX')
     else:
         print('Unet exists for ONNX')
 
-def convert_unet_ov(unet):
+def convert_unet_ov(pipe):
     if not UNET_OV_PATH.exists():
-        convert_unet_onnx(unet, UNET_ONNX_PATH)
+        convert_unet_onnx(pipe, UNET_ONNX_PATH)
         os.system("mo --input_model " + UNET_ONNX_PATH.parent.name + "/" + UNET_ONNX_PATH.name + " --output_dir " + UNET_OV_PATH.parent.name + " --compress_to_fp16")
         print('Unet successfully converted to IR')
     else:
@@ -130,47 +152,7 @@ def convert_unet_ov(unet):
 # During latent diffusion training, the encoder is used to get the latent representations (latents) of the images for the forward diffusion process, which applies more and more noise at each step. During inference, the denoised latents generated by the reverse diffusion process are converted back into images using the VAE decoder. As we will see during inference we **only need the VAE decoder**.
 # 
 # In our inference pipeline, we will need only decoding part of VAE, but forward function, which used for tracing runs encoding too. For obtaining only necessary part of model, we will wrap it into new model class.
-def convert_vae_encoder_onnx(vae:StableDiffusionPipeline, onnx_path:Path):
-    """
-    Convert VAE model to ONNX, then IR format. 
-    Function accepts pipeline, creates wrapper class for export only necessary for inference part, 
-    prepares example inputs for ONNX conversion via torch.export, 
-    Parameters: 
-        pipe (StableDiffusionInstructPix2PixPipeline): InstrcutPix2Pix pipeline
-        onnx_path (Path): File for storing onnx model
-    Returns:
-        None
-    """
-    class VAEEncoderWrapper(torch.nn.Module):
-        def __init__(self, vae):
-            super().__init__()
-            self.vae = vae
-
-        def forward(self, image):
-            h = self.vae.encoder(image)
-            moments = self.vae.quant_conv(h)
-            return moments
-
-    if not onnx_path.exists():
-        vae_encoder = VAEEncoderWrapper(vae)
-        vae_encoder.eval()
-        image = torch.zeros((1, 3, 512, 512))
-        with torch.no_grad():
-            torch.onnx.export(vae_encoder, image, onnx_path, input_names=[
-                              'init_image'], output_names=['image_latent'])
-        print('VAE encoder successfully converted to ONNX')
-    else:
-        print('VAE encoder exists for ONNX')
-        
-def convert_vae_encoder_ov(vae):
-    if not VAE_ENCODER_OV_PATH.exists():
-        convert_vae_encoder_onnx(vae, VAE_ENCODER_ONNX_PATH)
-        os.system("mo --input_model " + VAE_ENCODER_ONNX_PATH.parent.name + "/" + VAE_ENCODER_ONNX_PATH.name + " --output_dir " + VAE_ENCODER_OV_PATH.parent.name + " --compress_to_fp16")
-        print('VAE encoder successfully converted to IR')
-    else:
-        print('VAE encoder exists for IR')        
-
-def convert_vae_decoder_onnx(vae:StableDiffusionPipeline, onnx_path:Path):
+def convert_vae_onnx(pipe:StableDiffusionPipeline, onnx_path:Path):
     """
     Convert VAE model to ONNX, then IR format. 
     Function accepts pipeline, creates wrapper class for export only necessary for inference part, 
@@ -187,30 +169,46 @@ def convert_vae_decoder_onnx(vae:StableDiffusionPipeline, onnx_path:Path):
             self.vae = vae
 
         def forward(self, latents):
-            latents = 1 / 0.18215 * latents # community moved the factor from vae outside to inside
             return self.vae.decode(latents)
 
     if not onnx_path.exists():
-        vae_decoder = VAEDecoderWrapper(vae)
-        latents = torch.zeros((1, 4, 64, 64))
+        vae_decoder = VAEDecoderWrapper(pipe.vae)
+        text = 'a photo of an astronaut riding a horse on mars'
+        text_encoder = pipe.text_encoder
+        input_ids = pipe.tokenizer(
+            text,
+            padding="max_length",
+            max_length=pipe.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids
+        with torch.no_grad():
+            text_encoder_output = text_encoder(input_ids)
+        latents_shape = (2, 4, 512 // 8, 512 // 8)
+        latents = torch.randn(latents_shape)
+        t = torch.from_numpy(np.array(1, dtype=float))
+        max_length = input_ids.shape[-1]
+        uncond_input = pipe.tokenizer([""], padding="max_length", max_length=max_length, return_tensors="pt")
+        uncond_embeddings = pipe.text_encoder(uncond_input.input_ids)[0]
+        encoder_hidden_state = torch.cat([uncond_embeddings, text_encoder_output[0]])
+        output_latents = pipe.unet(latents, t, encoder_hidden_state)[0]
+        latents_uncond, latents_text = output_latents[0].unsqueeze(0), output_latents[1].unsqueeze(0)
+        latents = latents_uncond + 7.5 * (latents_text - latents_uncond)
 
         vae_decoder.eval()
         with torch.no_grad():
-            torch.onnx.export(vae_decoder, latents, onnx_path, input_names=[
-                              'latents'], output_names=['sample'])
+            torch.onnx.export(vae_decoder, latents, onnx_path, input_names=['latents'], output_names=['sample'])
         print('VAE decoder successfully converted to ONNX')
     else:
         print('VAE decoder exists for ONNX')
 
-def convert_vae_decoder_ov(vae):
-    if not VAE_DECODER_OV_PATH.exists():
-        convert_vae_decoder_onnx(vae, VAE_DECODER_ONNX_PATH)
-        os.system("mo --input_model " + VAE_DECODER_ONNX_PATH.parent.name + "/" + VAE_DECODER_ONNX_PATH.name + " --output_dir " + VAE_DECODER_OV_PATH.parent.name + " --compress_to_fp16")
-        print('VAE decoder successfully converted to IR')
+def convert_vae_ov(pipe):
+    if not VAE_OV_PATH.exists():
+        convert_vae_onnx(pipe, VAE_ONNX_PATH)
+        os.system("mo --input_model " + VAE_ONNX_PATH.parent.name + "/" + VAE_ONNX_PATH.name + " --output_dir " + VAE_OV_PATH.parent.name + " --compress_to_fp16")
+        print('VAE successfully converted to IR')
     else:
-        print('VAE decoder exists for IR')
-
-######################################################################
+        print('VAE exists for IR')
 
 # The stable diffusion model takes both a latent seed and a text prompt as an input. The latent seed is then used to generate random latent image representations of size $64 \times 64$ where as the text prompt is transformed to text embeddings of size $77 \times 768$ via CLIP's text encoder.
 # 
@@ -228,12 +226,11 @@ def convert_vae_decoder_ov(vae):
 class OVStableDiffusionPipeline(DiffusionPipeline):
     def __init__(
         self,
-        vae_encoder: Model,
-        vae_decoder: Model,
+        vae: Model,
         text_encoder: Model,
         tokenizer: CLIPTokenizer,
         unet: Model,
-        scheduler: Union[DDIMScheduler, PNDMScheduler, LMSDiscreteScheduler, EulerAncestralDiscreteScheduler],
+        scheduler: Union[DDIMScheduler, PNDMScheduler, LMSDiscreteScheduler],
     ):
         """
         Pipeline for text-to-image generation using Stable Diffusion.
@@ -253,14 +250,12 @@ class OVStableDiffusionPipeline(DiffusionPipeline):
         """
         super().__init__()
         self.scheduler = scheduler
-        self.vae_encoder = vae_encoder
-        self.vae_decoder = vae_decoder
+        self.vae = vae
         self.text_encoder = text_encoder
         self.unet = unet
         self._text_encoder_output = text_encoder.output(0)
         self._unet_output = unet.output(0)
-        self._vae_e_output = vae_encoder.output(0) if vae_encoder is not None else None
-        self._vae_d_output = vae_decoder.output(0)
+        self._vae_output = vae.output(0)
         self.height = self.unet.input(0).shape[2] * 8
         self.width = self.unet.input(0).shape[3] * 8
         self.tokenizer = tokenizer
@@ -268,18 +263,15 @@ class OVStableDiffusionPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        prompt: [str],
-        negative_prompt: [str],
+        prompt: Union[str, List[str]],
+        negative_prompt: Union[str, List[str]],
         num_inference_steps: Optional[int] = 50,
         guidance_scale: Optional[float] = 7.5,
         eta: Optional[float] = 0.0,
-        image: PIL.Image.Image = None,
-        strength: Optional[float] = 0.5,
+        latents: Optional[np.array] = None,
         output_type: Optional[str] = "pil",
         seed: Optional[int] = None,
-        mask: Optional[any] = None,
         gif: Optional[bool] = False,
-        callback: Optional[any] = None,
         **kwargs,
     ):
         """
@@ -298,35 +290,31 @@ class OVStableDiffusionPipeline(DiffusionPipeline):
             eta (float, *optional*, defaults to 0.0):
                 Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
                 [DDIMScheduler], will be ignored for others.
-            image (PIL.Image.Image, *optional*, None):
-                 Intinal image for generation.    
-            strength:
-                Strength of the noise in image to image. 
+            latents (torch.FloatTensor, *optional*):
+                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor will ge generated by sampling using the supplied random generator.
             output_type (`str`, *optional*, defaults to "pil"):
                 The output format of the generate image. Choose between
                 [PIL](https://pillow.readthedocs.io/en/stable/): PIL.Image.Image or np.array.
             seed (int, *optional*, None):
                 Seed for random generator state initialization.
-            mask:
-                Mask for inpaint image to image
             gif (bool, *optional*, False):
                 Flag for storing all steps results or not.
-            callback:
-                Callback once after a step. 
         Returns:
             Dictionary with keys: 
                 sample - the last generated image PIL.Image.Image or np.array
                 iterations - *optional* (if gif=True) images for all diffusion steps, List of PIL.Image.Image or np.array.
         """
-
         if seed is not None:
             np.random.seed(seed)
-            generator = torch.manual_seed(seed)
 
         if isinstance(prompt, str):
             batch_size = 1
+        elif isinstance(prompt, list):
+            batch_size = len(prompt)
         else:
-            raise ValueError(f"`prompt` has to be of type `str` but is {type(prompt)}")
+            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
         img_buffer = []
         # get prompt text embeddings
@@ -343,7 +331,7 @@ class OVStableDiffusionPipeline(DiffusionPipeline):
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
         # get unconditional embeddings for classifier free guidance
-        if do_classifier_free_guidance:
+        if True: #Force add negative prompt #do_classifier_free_guidance:
             max_length = text_input.input_ids.shape[-1]
             uncond_input = self.tokenizer(
                 negative_prompt, padding="max_length", max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="np"
@@ -355,41 +343,28 @@ class OVStableDiffusionPipeline(DiffusionPipeline):
             # to avoid doing two forward passes
             text_embeddings = np.concatenate([uncond_embeddings, text_embeddings])
 
+        # get the initial random noise unless the user supplied it
+        latents_shape = (batch_size, 4, self.height // 8, self.width // 8)
+        if latents is None:
+            latents = np.random.randn(
+                *latents_shape
+            )
+        else:
+            if latents.shape != latents_shape:
+                raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {latents_shape}")
+
         # set timesteps
         accepts_offset = "offset" in set(inspect.signature(self.scheduler.set_timesteps).parameters.keys())
         extra_set_kwargs = {}
-        offset = 0
         if accepts_offset:
-            offset = 1
             extra_set_kwargs["offset"] = 1
 
         self.scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
-        timesteps = self.scheduler.timesteps        
+        timesteps = self.scheduler.timesteps
 
-        # get the initial random noise unless the user supplied it
-        latents_shape = (batch_size, 4, self.height // 8, self.width // 8)
-       
-        # initialize first latents
-        noise = np.random.randn(*latents_shape)
-        num_modify_steps = num_inference_steps + offset
-        if image is None:
-            latents = noise
-            meta = {}
-        else:
-            num_modify_steps = int(num_inference_steps * strength) + offset
-            num_modify_steps = min(num_modify_steps, num_inference_steps)
-            ts = np.array([timesteps[-num_modify_steps]])
-            init_latents, latents, meta = self.prepare_latents(image, noise, ts)
-            init_latents = np.array(init_latents)
-            latents = np.array(latents)
-            # handle mask
-            #if mask is not None:
-            
-            
         # if we use LMSDiscreteScheduler, let's make sure latents are mulitplied by sigmas
         if isinstance(self.scheduler, LMSDiscreteScheduler):
             latents = latents * self.scheduler.sigmas[0].numpy()
-            
 
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
@@ -400,15 +375,7 @@ class OVStableDiffusionPipeline(DiffusionPipeline):
         if accepts_eta:
             extra_step_kwargs["eta"] = eta
 
-        t_start = max(num_inference_steps - num_modify_steps + offset, 0)
         for i, t in enumerate(self.progress_bar(timesteps)):
-            # jump over the first several steps when image to image
-            if i < t_start:
-                # callback each step
-                if callback is not None:
-                    callback()
-                continue
-                
             # expand the latents if we are doing classifier free guidance
             latent_model_input = np.concatenate([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -419,182 +386,27 @@ class OVStableDiffusionPipeline(DiffusionPipeline):
             if do_classifier_free_guidance:
                 noise_pred_uncond, noise_pred_text = noise_pred[0], noise_pred[1]
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                
-            #torch.save(noise_pred, str(i)+"_nsp.np")
-            #torch.save(latents, str(i)+"_lts.np")
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(torch.from_numpy(noise_pred), t, torch.from_numpy(latents), generator=generator, **extra_step_kwargs)["prev_sample"].numpy()
-            
-            # add mask
-            if image is not None and mask is not None:
-                ts = np.array([timesteps[i]])
-                init_latents_proper = self.add_noise(init_latents, noise, ts)
-                latents = ((init_latents_proper * mask) + (latents * (1 - mask)))
-            
-            # save for gif if needed
+            latents = self.scheduler.step(torch.from_numpy(noise_pred), t, torch.from_numpy(latents), **extra_step_kwargs)["prev_sample"].numpy()
             if gif:
-                image_output = self.vae_decoder(latents)[self._vae_d_output]
-                image_output = self.postprocess_image(image_output, meta, output_type)
-                img_buffer.extend(image_output)
-                
-            # callback each step
-            if callback is not None:
-                callback()
+                image = self.vae(1 / 0.18215 * latents)[self._vae_output]
+                image = (image / 2 + 0.5).clip(0, 1)
+                image = image.transpose(0, 2, 3, 1)
+                if output_type == "pil":
+                    image = self.numpy_to_pil(image)
+                img_buffer.extend(image)
 
         # scale and decode the image latents with vae
-        #latents = 1 / 0.18215 * latents    # community moved the 0.18215 into vae decoder forward code
-        image_output = self.vae_decoder(latents)[self._vae_d_output]
-        image_output = self.postprocess_image(image_output, meta, output_type)
+        latents = 1 / 0.18215 * latents
+        image = self.vae(latents)[self._vae_output]
 
-        return {"sample": image_output, 'iterations': img_buffer}
-
-    #---------------------------------------------------------------------------------------------------------
-    def add_noise(self, original_samples, noise, timesteps):
-        scheduler = self.scheduler
-        schedule_timesteps = scheduler.timesteps
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-        sigma = scheduler.sigmas[step_indices].flatten()
-        while len(sigma.shape) < len(original_samples.shape):
-            sigma = sigma.unsqueeze(-1)
-        noisy_samples = original_samples + noise * np.array(sigma)
-        return noisy_samples
-            
-    
-    def scale_fit_to_window(self, dst_width:int, dst_height:int, image_width:int, image_height:int):
-        """
-        Preprocessing helper function for calculating image size for resize with peserving original aspect ratio 
-        and fitting image to specific window size
-        
-        Parameters:
-          dst_width (int): destination window width
-          dst_height (int): destination window height
-          image_width (int): source image width
-          image_height (int): source image height
-        Returns:
-          result_width (int): calculated width for resize
-          result_height (int): calculated height for resize
-        """
-        im_scale = min(dst_height / image_height, dst_width / image_width)
-        return int(im_scale * image_width), int(im_scale * image_height)
-
-
-    def preprocess(self, image: PIL.Image.Image):
-        """
-        Image preprocessing function. Takes image in PIL.Image format, resizes it to keep aspect ration and fits to model input window 512x512,
-        then converts it to np.ndarray and adds padding with zeros on right or bottom side of image (depends from aspect ratio), after that
-        converts data to float32 data type and change range of values from [0, 255] to [-1, 1], finally, converts data layout from planar NHWC to NCHW.
-        The function returns preprocessed input tensor and padding size, which can be used in postprocessing.
-        
-        Parameters:
-          image (PIL.Image.Image): input image
-        Returns:
-           image (np.ndarray): preprocessed image tensor
-           meta (Dict): dictionary with preprocessing metadata info
-        """
-        src_width, src_height = image.size
-        dst_width, dst_height = self.scale_fit_to_window(
-            512, 512, src_width, src_height)
-        image = np.array(image.resize((dst_width, dst_height),
-                         resample=PIL.Image.Resampling.LANCZOS))[None, :]
-        pad_width = 512 - dst_width
-        pad_height = 512 - dst_height
-        pad = ((0, 0), (0, pad_height), (0, pad_width), (0, 0))
-        image = np.pad(image, pad, mode="constant")
-        image = image.astype(np.float32) / 255.0
-        image = 2.0 * image - 1.0
-        image = image.transpose(0, 3, 1, 2)
-        return image, {"padding": pad, "src_width": src_width, "src_height": src_height}
-
-    def prepare_latents(self, image:PIL.Image.Image, noise, latent_timestep:torch.Tensor):
-        """
-        Function for getting initial latents for starting generation
-        
-        Parameters:
-            image (PIL.Image.Image, *optional*, None):
-                Input image for generation, if not provided randon noise will be used as starting point
-            latent_timestep (torch.Tensor, *optional*, None):
-                Predicted by scheduler initial step for image generation, required for latent image mixing with nosie
-        Returns:
-            latents (np.ndarray):
-                Image encoded in latent space
-        """
-        latents_shape = (1, 4, self.height // 8, self.width // 8)
-        #noise = np.random.randn(*latents_shape).astype(np.float32)
-        if image is None:
-            # if we use LMSDiscreteScheduler, let's make sure latents are mulitplied by sigmas
-            if isinstance(self.scheduler, LMSDiscreteScheduler):
-                noise = noise * self.scheduler.sigmas[0].numpy()
-            return noise, {}
-        input_image, meta = self.preprocess(image)
-        moments = self.vae_encoder(input_image)[self._vae_e_output]
-        mean, logvar = np.split(moments, 2, axis=1) 
-        std = np.exp(logvar * 0.5)
-        init_latents = (mean + std * np.random.randn(*mean.shape)) * 0.18215
-        #latents = self.scheduler.add_noise(torch.from_numpy(latents), torch.from_numpy(noise), latent_timestep).numpy()
-        latents = self.add_noise(init_latents, noise, latent_timestep)
-        return init_latents, latents, meta
-
-    def postprocess_image(self, image:np.ndarray, meta:Dict, output_type:str = "pil"):
-        """
-        Postprocessing for decoded image. Takes generated image decoded by VAE decoder, unpad it to initila image size (if required), 
-        normalize and convert to [0, 255] pixels range. Optionally, convertes it from np.ndarray to PIL.Image format
-        
-        Parameters:
-            image (np.ndarray):
-                Generated image
-            meta (Dict):
-                Metadata obtained on latents preparing step, can be empty
-            output_type (str, *optional*, pil):
-                Output format for result, can be pil or numpy
-        Returns:
-            image (List of np.ndarray or PIL.Image.Image):
-                Postprocessed images
-        """
-        if "padding" in meta:
-            pad = meta["padding"]
-            (_, end_h), (_, end_w) = pad[1:3]
-            h, w = image.shape[2:]
-            unpad_h = h - end_h
-            unpad_w = w - end_w
-            image = image[:, :, :unpad_h, :unpad_w]
-        image = np.clip(image / 2 + 0.5, 0, 1)
-        image = np.transpose(image, (0, 2, 3, 1))
-        # 9. Convert to PIL
+        image = (image / 2 + 0.5).clip(0, 1)
+        image = image.transpose(0, 2, 3, 1)
         if output_type == "pil":
             image = self.numpy_to_pil(image)
-            if "src_height" in meta:
-                orig_height, orig_width = meta["src_height"], meta["src_width"]
-                image = [img.resize((orig_width, orig_height),
-                                    PIL.Image.Resampling.LANCZOS) for img in image]
-        else:
-            if "src_height" in meta:
-                orig_height, orig_width = meta["src_height"], meta["src_width"]
-                image = [cv2.resize(img, (orig_width, orig_width))
-                         for img in image]
-        return image
-    '''
-    def get_timesteps(self, num_inference_steps:int, strength:float):
-        """
-        Helper function for getting scheduler timesteps for generation
-        In case of image-to-image generation, it updates number of steps according to strength
-        
-        Parameters:
-           num_inference_steps (int):
-              number of inference steps for generation
-           strength (float):
-               value between 0.0 and 1.0, that controls the amount of noise that is added to the input image. 
-               Values that approach 1.0 allow for lots of variations but will also produce images that are not semantically consistent with the input.
-        """
-        # get the original timestep using init_timestep
-        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
 
-        t_start = max(num_inference_steps - init_timestep, 0)
-        timesteps = self.scheduler.timesteps[t_start:]
-
-        return timesteps, num_inference_steps - t_start 
-    '''
-
+        return {"sample": image, 'iterations': img_buffer}
 
 import re
 def validateTitle(title):
@@ -603,71 +415,55 @@ def validateTitle(title):
 
 # ### EXPORT
 #
-#REPO = "darkstorm2150/Protogen_v5.3_Official_Release"
-REPO = "windwhinny/chilloutmix"
-#REPO = "compvis/stable-diffusion-v1-4"
+#REPO = "windwhinny/chilloutmix"
+REPO = "compvis/stable-diffusion-v1-4"
 #REPO = "runwayml/stable-diffusion-v1-5"
 
 def downloadModel():
-    if not TEXT_ENCODER_OV_PATH.exists() or not UNET_OV_PATH.exists() or not VAE_DECODER_OV_PATH.exists():
+    if not TEXT_ENCODER_OV_PATH.exists() or not UNET_OV_PATH.exists() or not VAE_OV_PATH.exists():
         if not os.path.exists('ovTempModels'):
             os.mkdir('ovTempModels')
         if not os.path.exists('ovModels'):
             os.mkdir('ovModels')    
         pipe = StableDiffusionPipeline.from_pretrained(REPO, force_download=False)
-        text_encoder = pipe.text_encoder
-        text_encoder.eval()
-        unet = pipe.unet
-        unet.eval()
-        vae = pipe.vae
-        vae.eval()
+        convert_encoder_ov(pipe)
+        convert_unet_ov(pipe)
+        convert_vae_ov(pipe)        
         del pipe
-        convert_encoder_ov(text_encoder)
-        del text_encoder
-        convert_unet_ov(unet)
-        del unet
-        convert_vae_encoder_ov(vae)   
-        convert_vae_decoder_ov(vae)
-        del vae
-
     
 def compileModel(xpu):
-    if 'CPU' in xpu or 'GPU' in xpu:
+    if xpu == 'CPU' or xpu == 'GPU':
         core = Core()
         text_enc = core.compile_model(TEXT_ENCODER_OV_PATH, xpu)
         unet_model = core.compile_model(UNET_OV_PATH, xpu)
-        vae_encoder = core.compile_model(VAE_ENCODER_OV_PATH, xpu)
-        vae_decoder = core.compile_model(VAE_DECODER_OV_PATH, xpu)
+        vae = core.compile_model(VAE_OV_PATH, xpu)
         
         '''
-        scheduler = LMSDiscreteScheduler(
+        lms = LMSDiscreteScheduler(
             beta_start=0.00085, 
             beta_end=0.012, 
             beta_schedule="scaled_linear"
         )
         tokenizer = CLIPTokenizer.from_pretrained('openai/clip-vit-large-patch14')
         '''
-
-        try:
-            #scheduler = LMSDiscreteScheduler.from_pretrained(REPO, subfolder="scheduler")
-            scheduler = EulerAncestralDiscreteScheduler.from_pretrained(REPO, subfolder="scheduler")
+        NOINTERNET = True
+        if NOINTERNET:
+            lms = LMSDiscreteScheduler.from_pretrained('ovModels', subfolder="scheduler")
+            tokenizer = CLIPTokenizer.from_pretrained('ovModels', subfolder="tokenizer")        
+        else:
+            lms = LMSDiscreteScheduler.from_pretrained(REPO, subfolder="scheduler")
             tokenizer = CLIPTokenizer.from_pretrained(REPO, subfolder="tokenizer")
-        except:
-            #scheduler = LMSDiscreteScheduler.from_pretrained('ovModels', subfolder="scheduler")
-            scheduler = EulerAncestralDiscreteScheduler.from_pretrained('ovModels', subfolder="scheduler")
-            tokenizer = CLIPTokenizer.from_pretrained('ovModels', subfolder="tokenizer")              
 
         ov_pipe = OVStableDiffusionPipeline(
             tokenizer=tokenizer,
             text_encoder=text_enc,
             unet=unet_model,
-            vae_encoder=vae_encoder,
-            vae_decoder=vae_decoder,
-            scheduler=scheduler
+            vae=vae,
+            scheduler=lms
         )        
         return ov_pipe
 
-def generateImage(xpu, ov_pipe, prompt='horse', negative='', seed=0, steps=20, image="", strength=0.5, mask=None, callback=None):
+def generateImage(xpu, ov_pipe, prompt='horse', negative='', seed=0, steps=20):
     if not os.path.exists('output'):
         os.mkdir('output')
 
@@ -677,16 +473,71 @@ def generateImage(xpu, ov_pipe, prompt='horse', negative='', seed=0, steps=20, i
     print(f'Seed: {seed}')
     print(f'Number of steps: {steps}')
     
-    try:
-        input_image = PIL.Image.open(image)
-    except:
-        input_image = None
+    #generator = torch.manual_seed(int(seed))
     
-    result = ov_pipe(prompt, negative_prompt=negative, num_inference_steps=int(steps), seed=int(seed), image=input_image, strength=strength, mask=mask, gif=False, callback=callback)
+    result = ov_pipe(prompt, negative_prompt=negative, num_inference_steps=int(steps), seed=int(seed), gif=False)
 
-    str_image = validateTitle(str(prompt))[:100] + '_seed_' + str(seed) + '_step_' + str(steps)+'_time_'+str(int(time.time()))
+    str_image = validateTitle(str(prompt))[:40] + '_seed_' + str(seed) + '_step_' + str(steps)
 
     final_image = result['sample'][0]
     final_image.save('output/' + str(str_image)+'.png')
-    
     return 'output/' + str(str_image)+'.png'
+
+# ### MAIN
+#   
+if __name__ == "__main__":     
+    downloadModel()
+    ov_pipe = compileModel()
+    imagename = generateImage('xpu', ov_pipe)
+    print(imagename)
+'''   
+    #os.system('pip install -r requirements.txt')
+    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", force_download=False)
+    
+    os.mkdir('ovModels')
+    
+    convert_encoder_ov(pipe)
+    convert_unet_ov(pipe)
+    convert_vae_ov(pipe)
+    
+    core = Core()
+    text_enc = core.compile_model(TEXT_ENCODER_OV_PATH, 'GPU')
+    unet_model = core.compile_model(UNET_OV_PATH, 'GPU')
+    vae = core.compile_model(VAE_OV_PATH, 'GPU')
+    
+    lms = LMSDiscreteScheduler(
+        beta_start=0.00085, 
+        beta_end=0.012, 
+        beta_schedule="scaled_linear"
+    )
+    tokenizer = CLIPTokenizer.from_pretrained('openai/clip-vit-large-patch14')
+
+    ov_pipe = OVStableDiffusionPipeline(
+        tokenizer=tokenizer,
+        text_encoder=text_enc,
+        unet=unet_model,
+        vae=vae,
+        scheduler=lms
+    )    
+
+    text_prompt = 'an old man with a horse'
+    num_steps = 50
+    seed = random.randint(0, 1024)  
+    
+    print('Pipeline settings')
+    print(f'Input text: {text_prompt}')
+    print(f'Seed: {seed}')
+    print(f'Number of steps: {num_steps}')
+    
+    useGif = False
+    result = ov_pipe(text_prompt, num_inference_steps=int(num_steps), seed=int(seed), gif=useGif)
+
+    str_image = str(text_prompt) + '_seed_' + str(seed) + '_step_' + str(num_steps)
+
+    final_image = result['sample'][0]
+    if useGif:
+        all_frames = result['iterations']
+        img = next(iter(all_frames))
+        img.save(fp='output/gif/'+str(str_image)+'.gif', format='GIF', append_images=iter(all_frames), save_all=True, duration=len(all_frames) * 5, loop=0)
+    final_image.save('output/png/'+str(str_image)+'.png')
+'''
