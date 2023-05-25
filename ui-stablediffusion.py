@@ -12,10 +12,11 @@ from translate import translateYouDao
 import numpy as np
 from io import BytesIO
 import win32clipboard
-
+import os
+import csv
 
 # version info
-VERSION = 'v2.1 -beta'
+VERSION = 'v2.2'
 
 # You known you're on which platform, may change to auto-adapt in the future
 PLATFORM = "I"
@@ -35,6 +36,9 @@ RES_ORIGINAL = 512
 RES_PREVIEW  = 64
 RES_LOCK     = 192
 RES_MASK     = 64
+
+# define log file
+FILE_LOG = "./perflog.csv"
 
 # special settings for chilloutmix model(human portrait)
 CHILL_MODEL = True
@@ -110,6 +114,15 @@ else:
     "poorly drawn face",
     "out of frame",
     "worst quality"]
+    
+def appendCsv(file, row):
+    try:
+        with open(file, mode='a', newline='', encoding='utf-8-sig') as f:
+            write = csv.writer(f)
+            write.writerow(row)
+            f.close
+    except:
+        pass
 
 class UiStableDiffusion():
     def __init__(self):
@@ -187,12 +200,12 @@ class UiStableDiffusion():
             platformRadiobutton.grid(row=0, column=num, padx=5, pady=0)    
         '''
 
-        self.listXpu = [('CPU   ', 0), ('GPU 0 ', 1), ('GPU 1 ', 2)]
+        self.listXpu = [('CPU ', 0), ('GPU0', 1), ('GPU1', 2), ('AUTO', 3)]
         self.vXpu = IntVar()
-        self.vXpu.set(2)
+        self.vXpu.set(3)
         
         for xpu, num in self.listXpu:
-            self.xpuRadiobutton = Radiobutton(self.bottomFrame, text=xpu, variable=self.vXpu, value=num, width=10, indicatoron=False)
+            self.xpuRadiobutton = Radiobutton(self.bottomFrame, text=xpu, variable=self.vXpu, value=num, width=6, indicatoron=False)
             self.xpuRadiobutton.grid(row=1, column=num, padx=5, pady=10)
 
         self.notifyLabel = ttkbootstrap.Label(self.bottomFrame, text='Re-Initialize after CPU/GPU Switch.', bootstyle=WARNING)    
@@ -201,9 +214,9 @@ class UiStableDiffusion():
         self.generateAllProgressbar = ttkbootstrap.Progressbar(self.bottomFrame, length=280, style='secondary.Striped.Horizontal.TProgressbar')
 
         self.notifyLabel.grid(row=2, column=0, columnspan=3, padx=5, pady=10)    
-        self.timeLabel.grid(row=1, column=3, rowspan=2, padx=20, pady=10)
-        self.generateProgressbar.grid(row=1, column=4, padx=5, pady=10)
-        self.generateAllProgressbar.grid(row=2, column=4, padx=5, pady=10)
+        self.timeLabel.grid(row=1, column=4, rowspan=2, padx=20, pady=10)
+        self.generateProgressbar.grid(row=1, column=5, padx=5, pady=10)
+        self.generateAllProgressbar.grid(row=2, column=5, padx=5, pady=10)
 
         # ====    locate preview and input image in right Frame
         self.listGeneratedImages = []   #generated images, can be many
@@ -266,6 +279,10 @@ class UiStableDiffusion():
         self.endY   = 0
         self.listMaskRect = []
                 
+        if not os.path.exists(FILE_LOG): 
+            rowFirstLine = ["Timestamp", "TimeCost", "Steps", "Seed", "Prompt", "Negative"]
+            appendCsv(FILE_LOG, rowFirstLine)
+                
         #==========================
         # kick off async thread
         self.root.after(100, self.asyncLoopGenerate)
@@ -299,7 +316,11 @@ class UiStableDiffusion():
         elif xpuIndex == 2: #GPU 1
             self.localPipe = compileModel('GPU.1')
             self.canvasImage = ImageTk.PhotoImage(Image.open('ui/ui-ready.png'))
-            self.canvasLabel.configure(image=self.canvasImage)              
+            self.canvasLabel.configure(image=self.canvasImage)     
+        elif xpuIndex == 3: #AUTO
+            self.localPipe = compileModel('AUTO')
+            self.canvasImage = ImageTk.PhotoImage(Image.open('ui/ui-ready.png'))
+            self.canvasLabel.configure(image=self.canvasImage) 
 
         # clear progressbar
         self.generateProgressbar['value'] = 0
@@ -462,6 +483,8 @@ class UiStableDiffusion():
                             taskGenerate = ['GPU.0', prompt, negative, seed, steps, image, strength, mask]
                         elif xpuIndex == 2: #GPU 1
                             taskGenerate = ['GPU.1', prompt, negative, seed, steps, image, strength, mask]
+                        elif xpuIndex == 3: #AUTO
+                            taskGenerate = ['AUTO', prompt, negative, seed, steps, image, strength, mask]
                         self.queueTaskGenerate.put(taskGenerate)
                         
                 self.generateButton['text'] = 'Interrupt'
@@ -521,6 +544,8 @@ class UiStableDiffusion():
                 endTime = time.time()
                 useTime = endTime-startTime
                 roughSteps = int(steps) if image == "" else int(steps)*float(strength)
+                rowLog = [time.strftime("%Y/%m/%d-%H:%M:%S", time.localtime()), str(useTime), str(roughSteps), str(seed), str(prompt), str(negative)]
+                appendCsv(FILE_LOG, rowLog)
                 self.timeLabel.configure(text='Time: ' + "%.2f"%useTime + 's (' + "%.2f"%(roughSteps/useTime) + 'it/s)')   
                 self.insertGeneratedImage(self.mainImageFile)
                 self.vGeneratedImage.set(0)
@@ -528,9 +553,11 @@ class UiStableDiffusion():
             except NameError:
                 self.canvasImage = ImageTk.PhotoImage(Image.open('ui/ui-initialize.png'))
                 self.canvasLabel.configure(image=self.canvasImage)
+                self.generateButton['text'] = 'Generate'
             except ValueError:
                 self.canvasImage = ImageTk.PhotoImage(Image.open('ui/ui-input.png'))
                 self.canvasLabel.configure(image=self.canvasImage)   
+                self.generateButton['text'] = 'Generate'
         else:   # not in generation work, free for next work
             self.generateButton['text'] = 'Generate'
             # show selected image to main canvas

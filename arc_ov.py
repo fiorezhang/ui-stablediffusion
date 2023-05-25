@@ -632,7 +632,7 @@ def downloadModel():
 
     
 def compileModel(xpu):
-    if 'CPU' in xpu or 'GPU' in xpu:
+    if 'CPU' in xpu or 'GPU' in xpu or 'AUTO' in xpu:
         core = Core()
         text_enc = core.compile_model(TEXT_ENCODER_OV_PATH, xpu)
         unet_model = core.compile_model(UNET_OV_PATH, xpu)
