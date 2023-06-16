@@ -137,7 +137,7 @@ class UiStableDiffusion():
         self.leftFrame = ttkbootstrap.Frame(self.root, width=250, height=540)
         self.middleFrame = ttkbootstrap.Frame(self.root, width=540, height=540)
         self.bottomFrame = ttkbootstrap.Frame(self.root, width=800, height=95)
-        self.rightFrame = ttkbootstrap.Frame(self.root, width=260, height=645)
+        self.rightFrame = ttkbootstrap.Frame(self.root, width=270, height=645)
 
         self.leftFrame.grid(row=0, column=0, padx=5, pady=5)
         self.leftFrame.grid_propagate(False)
@@ -231,8 +231,8 @@ class UiStableDiffusion():
             self.imageRadiobutton.grid(row=1+int(indexImage/3), column=int(indexImage%3), padx=5, pady=5)
             self.listGeneratedCanvas.append({'button':self.imageRadiobutton, 'image':self.canvasGeneratedImage})
             
-        self.lockButton = ttkbootstrap.Button(self.rightFrame, text='Lock ↓↓', command=self.lockCallback, bootstyle=(LIGHT, OUTLINE))
-        self.unlockButton = ttkbootstrap.Button(self.rightFrame, text='Unlock', command=self.unlockCallback, bootstyle=(LIGHT, OUTLINE))
+        self.lockButton = ttkbootstrap.Button(self.rightFrame, text='Lock ↓↓', width="6", command=self.lockCallback, bootstyle=(LIGHT, OUTLINE))
+        self.unlockButton = ttkbootstrap.Button(self.rightFrame, text='Unlock', width="6", command=self.unlockCallback, bootstyle=(LIGHT, OUTLINE))
         self.inputLabel = ttkbootstrap.Label(self.rightFrame, text='Input image')       
         self.canvasLockedCanvas = ttkbootstrap.Canvas(self.rightFrame, width=RES_LOCK, height=RES_LOCK)
         self.canvasLockedImage = ImageTk.PhotoImage(Image.open('ui/ui-blank.png').resize((RES_LOCK, RES_LOCK)))
@@ -241,8 +241,8 @@ class UiStableDiffusion():
         self.noiseScale = ttkbootstrap.Scale(self.rightFrame, from_=1, to=10, orient=HORIZONTAL)
         self.noiseScale.set(5)
         self.maskLabel = ttkbootstrap.Label(self.rightFrame, text='Inpaint masked')
-        self.clearMaskButton = ttkbootstrap.Button(self.rightFrame, text='Clear <<', command=self.clearMaskCallback, bootstyle=(LIGHT, OUTLINE))
-        self.backMaskButton = ttkbootstrap.Button(self.rightFrame, text='  Back <', command=self.backMaskCallback, bootstyle=(LIGHT, OUTLINE))
+        self.clearMaskButton = ttkbootstrap.Button(self.rightFrame, text='Clear <<', width="6", command=self.clearMaskCallback, bootstyle=(LIGHT, OUTLINE))
+        self.backMaskButton = ttkbootstrap.Button(self.rightFrame, text='  Back <', width="6", command=self.backMaskCallback, bootstyle=(LIGHT, OUTLINE))
         
         self.previewLabel.grid(row=0, column=0, columnspan=3, padx=5, pady=5)
         self.lockButton.grid(row=1+round(MAX_LIST_GENERATED_IMAGES/3), column=0, padx=5, pady=5)
